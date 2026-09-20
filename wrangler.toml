@@ -1,0 +1,27 @@
+name = "draw-jam"
+main = "index.js"
+compatibility_date = "2025-06-01"
+workers_dev = true
+
+# Tu subdominio: Cloudflare crea el DNS y el certificado solo
+[[routes]]
+pattern = "draw.vpuchades.nl"
+custom_domain = true
+
+# Workers AI: modelos open source en las GPUs de Cloudflare
+[ai]
+binding = "AI"
+
+# La "sala" en tiempo real que sincroniza todos los móviles
+[[durable_objects.bindings]]
+name = "DRAW_ROOM"
+class_name = "DrawRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DrawRoom"]
+
+# R2: guarda cada dibujo analizado (el bucket de la Parte 1)
+[[r2_buckets]]
+binding = "GALLERY"
+bucket_name = "draw-jam"
