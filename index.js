@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 
+const VERSION = "v3-guardarrailes";
 const BOARD = 900;                // pizarra cuadrada 900x900
 const MAX_STROKES = 2500;         // trazos que recordamos por sala
 const CHECK_SECONDS = 15;         // cada cuanto se revisa la pizarra
@@ -45,7 +46,9 @@ export default {
     if (url.pathname === "/p") return htmlResponse(pagePhone(room));
     if (url.pathname === "/galeria") return galleryPage(env, room);
     if (url.pathname.startsWith("/img/")) return serveImage(env, decodeURIComponent(url.pathname.slice(5)));
-    if (url.pathname === "/health") return Response.json({ ok: true, room, gateway: AI_GATEWAY_ID });
+    if (url.pathname === "/health") {
+      return Response.json({ ok: true, version: VERSION, room, gateway: AI_GATEWAY_ID });
+    }
     if (url.pathname === "/") return htmlResponse(pageStage(room, url.origin + "/p?room=" + room));
 
     return new Response("No encontrado", { status: 404 });
@@ -120,13 +123,37 @@ export class DrawRoom extends DurableObject {
 }
 
 /* ==================================================================
-   3) MODERACION
-   El modelo de vision DESCRIBE el dibujo con una pregunta neutra.
-   Ese texto pasa por AI Gateway -> Guardrails lo bloquea si procede.
-   Llama Guard 3 actua de segunda opinion. Si algo falla, se deja pasar.
+   3) MODERACION EN CAPAS
+   1. Descripcion neutra -> pasa por los Guardrails de AI Gateway
+   2. Tu lista negra propia sobre esa descripcion
+   3. Pregunta directa al modelo de vision
+   4. Segunda opinion con otro modelo de vision
+   5. Llama Guard 3 sobre el texto
+   Si un modelo falla, se deja pasar (fail-open) para no cortar la demo.
 ================================================================== */
 const DESCRIBE_QUESTION =
   "Describe in one short sentence what this hand-drawn doodle shows.";
+
+const EXPLICIT_QUESTION =
+  "Answer with only one word, yes or no. Could this hand-drawn doodle be interpreted as " +
+  "a weapon (gun, knife, bomb), a phallic shape, genitalia, a naked body, a sexual act, " +
+  "violence, blood, a middle finger, or an offensive symbol?";
+
+// TU lista negra. Anade o quita lo que quieras: esta es tu politica de contenido.
+const BANNED_WORDS = [
+  // armas y violencia
+  "gun", "firearm", "pistol", "rifle", "shotgun", "revolver", "weapon", "bullet",
+  "shooting", "knife", "blade", "bomb", "grenade", "explosive", "blood", "corpse",
+  // sexual
+  "penis", "phallic", "genital", "vagina", "breast", "nude", "naked", "sexual",
+  // odio y otros
+  "swastika", "nazi", "middle finger", "syringe", "drug"
+];
+
+function matchesBanned(text) {
+  const t = String(text || "").toLowerCase();
+  return BANNED_WORDS.find(function (w) { return t.includes(w); }) || null;
+}
 
 function isGuardrailError(m) {
   return /guardrail|blocked|unsafe|violat|content policy/i.test(String(m || ""));
@@ -147,6 +174,8 @@ async function checkTextSafety(env, text) {
 
 async function checkImageSafety(env, dataUrl) {
   let description = "";
+
+  // 1) Descripcion neutra -> su respuesta pasa por los Guardrails de AI Gateway
   try {
     const r = await aiRun(env, "@cf/moondream/moondream3.1-9B-A2B", {
       task: "query",
@@ -157,16 +186,51 @@ async function checkImageSafety(env, dataUrl) {
     });
     description = String(r?.answer || r?.caption || "").trim();
   } catch (e) {
-    if (isGuardrailError(e.message)) {
-      return { flagged: true, by: "ai-gateway-guardrails", description: "" };
-    }
-    return { flagged: false, error: e.message };
+    if (isGuardrailError(e.message)) return { flagged: true, by: "ai-gateway-guardrails" };
   }
 
-  if (!description) return { flagged: false };
+  // 2) Tu lista de contenido no permitido
+  const hit = matchesBanned(description);
+  if (hit) return { flagged: true, by: "politica-propia:" + hit, description };
 
-  const t = await checkTextSafety(env, description);
-  return { flagged: t.flagged, by: t.by, description };
+  // 3) Pregunta directa al modelo de vision
+  try {
+    const r = await aiRun(env, "@cf/moondream/moondream3.1-9B-A2B", {
+      task: "query",
+      image: dataUrl,
+      question: EXPLICIT_QUESTION,
+      reasoning: false,
+      max_tokens: 10
+    });
+    if (/^\s*yes/i.test(String(r?.answer || ""))) {
+      return { flagged: true, by: "moondream-directo", description };
+    }
+  } catch (e) { /* ignorado a proposito */ }
+
+  // 4) Segunda opinion con otro modelo de vision
+  try {
+    const r = await aiRun(env, "@cf/meta/llama-4-scout-17b-16e-instruct", {
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: EXPLICIT_QUESTION },
+          { type: "image_url", image_url: { url: dataUrl } }
+        ]
+      }],
+      max_tokens: 10
+    });
+    if (/^\s*yes/i.test(String(r?.response || ""))) {
+      return { flagged: true, by: "llama4-scout", description };
+    }
+  } catch (e) { /* ignorado a proposito */ }
+
+  // 5) Llama Guard 3 sobre el texto
+  if (description) {
+    const t = await checkTextSafety(env, description);
+    if (t.flagged) return { flagged: true, by: t.by, description };
+  }
+
+  return { flagged: false, description };
 }
 
 const BLOCKED_MSG = "Contenido no apropiado detectado. La pizarra se ha borrado automaticamente.";
@@ -222,7 +286,6 @@ async function guessDrawing(request, env, ctx, room) {
     let description = "";
     let guardBlocked = false;
 
-    // Moondream 3
     try {
       const r = await aiRun(env, "@cf/moondream/moondream3.1-9B-A2B", {
         task: "query",
@@ -238,7 +301,6 @@ async function guessDrawing(request, env, ctx, room) {
       if (isGuardrailError(e.message)) guardBlocked = true;
     }
 
-    // Red de seguridad: Llama 4 Scout
     if (!description && !guardBlocked) {
       try {
         const r = await aiRun(env, "@cf/meta/llama-4-scout-17b-16e-instruct", {
@@ -259,9 +321,15 @@ async function guessDrawing(request, env, ctx, room) {
       }
     }
 
-    if (guardBlocked) {
+    // Ultima red: la lista negra tambien sobre el resultado final
+    const hit = matchesBanned(description);
+    if (guardBlocked || hit) {
       await wipeRoom(env, room, BLOCKED_MSG);
-      return Response.json({ guess: BLOCKED_MSG, blocked: true, by: "ai-gateway-guardrails" });
+      return Response.json({
+        guess: BLOCKED_MSG,
+        blocked: true,
+        by: hit ? ("politica-propia:" + hit) : "ai-gateway-guardrails"
+      });
     }
 
     let verdict = description
@@ -622,7 +690,7 @@ function pageStage(room, phoneUrl) {
          </div>
          <div class="verdict" id="verdict">La IA esta esperando vuestro dibujo...</div>
          <p class="muted" style="font-size:.8rem; margin-top:8px;">
-           Vision: <strong>Moondream 3</strong> &middot; Texto: <strong>Llama 3.1 8B</strong> &middot; Moderacion: <strong>AI Gateway Guardrails + Llama Guard 3</strong> &middot; Todo via <strong>AI Gateway</strong>.
+           <strong>${VERSION}</strong> &middot; Vision: Moondream 3 &middot; Moderacion: AI Gateway Guardrails + Llama Guard 3 + politica propia &middot; Todo via AI Gateway.
          </p>
        </section>
      </div>`,
