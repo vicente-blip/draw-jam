@@ -4,7 +4,7 @@ const BOARD = 900;        // pizarra cuadrada 900x900
 const MAX_STROKES = 2500; // trazos que recordamos por sala
 
 /* ==================================================================
-   1) ROUTER — qué devolvemos en cada URL
+   1) ROUTER
 ================================================================== */
 export default {
   async fetch(request, env, ctx) {
@@ -31,7 +31,7 @@ export default {
     if (url.pathname === "/galeria") return galleryPage(env, room);
     if (url.pathname.startsWith("/img/")) return serveImage(env, decodeURIComponent(url.pathname.slice(5)));
     if (url.pathname === "/health") return Response.json({ ok: true, room });
-    if (url.pathname === "/") return htmlResponse(pageStage(room));
+    if (url.pathname === "/") return htmlResponse(pageStage(room, url.origin + "/p?room=" + room));
 
     return new Response("No encontrado", { status: 404 });
   }
@@ -39,14 +39,13 @@ export default {
 
 /* ==================================================================
    2) LA SALA EN TIEMPO REAL (Durable Object)
-   Recibe los trazos de cada movil y los reenvia a todos los demas.
 ================================================================== */
 export class DrawRoom extends DurableObject {
   async fetch(request) {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    this.ctx.acceptWebSocket(server); // WebSockets con hibernacion
+    this.ctx.acceptWebSocket(server);
 
     const map = await this.ctx.storage.list({ prefix: "s:", limit: MAX_STROKES });
     server.send(JSON.stringify({ type: "init", strokes: [...map.values()] }));
@@ -100,7 +99,7 @@ export class DrawRoom extends DurableObject {
 }
 
 /* ==================================================================
-   3) LA IA — modelos open source de Cloudflare (Workers AI)
+   3) LA IA (Workers AI) - modelos open source de Cloudflare
 ================================================================== */
 async function guessDrawing(request, env, ctx, room) {
   try {
@@ -110,7 +109,6 @@ async function guessDrawing(request, env, ctx, room) {
       return Response.json({ guess: "Todavia no veo nada dibujado." });
     }
 
-    // Modelo de vision: LLaVA 1.5 7B
     const vision = await env.AI.run("@cf/llava-hf/llava-1.5-7b-hf", {
       image: [...bytes],
       prompt:
@@ -123,7 +121,6 @@ async function guessDrawing(request, env, ctx, room) {
     const description = String(vision?.description || vision?.response || "").trim();
     let verdict = description || "No lo tengo claro, dibujad un poco mas!";
 
-    // Modelo de texto: lo pasa a espanol, corto y divertido
     try {
       const es = await env.AI.run("@cf/meta/llama-3.1-8b-instruct-fp8", {
         messages: [
@@ -141,20 +138,14 @@ async function guessDrawing(request, env, ctx, room) {
       if (es?.response) verdict = es.response.trim();
     } catch {}
 
-    // Avisa a todos los moviles conectados
     try {
       const stub = env.DRAW_ROOM.get(env.DRAW_ROOM.idFromName(room));
       await stub.announce(verdict);
     } catch {}
 
-    // Guarda el dibujo en R2 para la galeria
     ctx.waitUntil(saveSnapshot(env, room, bytes, verdict));
 
-    return Response.json({
-      guess: verdict,
-      raw: description,
-      models: ["@cf/llava-hf/llava-1.5-7b-hf", "@cf/meta/llama-3.1-8b-instruct-fp8"]
-    });
+    return Response.json({ guess: verdict, raw: description });
   } catch (err) {
     return Response.json({ guess: "La IA no ha podido mirar el dibujo: " + err.message });
   }
@@ -212,7 +203,171 @@ async function galleryPage(env, room) {
 }
 
 /* ==================================================================
-   5) UTILIDADES
+   5) GENERADOR DE QR PROPIO (sin librerias externas)
+   Codigo QR byte-mode, nivel de correccion L, versiones 1 a 5.
+================================================================== */
+const QR_EXP = new Uint8Array(512), QR_LOG = new Uint8Array(256);
+(function () {
+  let x = 1;
+  for (let i = 0; i < 255; i++) { QR_EXP[i] = x; QR_LOG[x] = i; x <<= 1; if (x & 0x100) x ^= 0x11d; }
+  for (let i = 255; i < 512; i++) QR_EXP[i] = QR_EXP[i - 255];
+})();
+const qrMul = (a, b) => (a === 0 || b === 0) ? 0 : QR_EXP[QR_LOG[a] + QR_LOG[b]];
+
+const QR_SPEC = { 1: [21, 19, 7, 0], 2: [25, 34, 10, 18], 3: [29, 55, 15, 22], 4: [33, 80, 20, 26], 5: [37, 108, 26, 30] };
+const QR_MASKS = [
+  (r, c) => (r + c) % 2 === 0,
+  (r, c) => r % 2 === 0,
+  (r, c) => c % 3 === 0,
+  (r, c) => (r + c) % 3 === 0,
+  (r, c) => (Math.floor(r / 2) + Math.floor(c / 3)) % 2 === 0,
+  (r, c) => ((r * c) % 2 + (r * c) % 3) === 0,
+  (r, c) => (((r * c) % 2 + (r * c) % 3) % 2) === 0,
+  (r, c) => (((r + c) % 2 + (r * c) % 3) % 2) === 0
+];
+
+function qrEcc(data, n) {
+  let g = [1];
+  for (let i = 0; i < n; i++) {
+    const next = new Array(g.length + 1).fill(0);
+    for (let j = 0; j < g.length; j++) { next[j] ^= g[j]; next[j + 1] ^= qrMul(g[j], QR_EXP[i]); }
+    g = next;
+  }
+  const res = data.concat(new Array(n).fill(0));
+  for (let i = 0; i < data.length; i++) {
+    const coef = res[i];
+    if (coef) for (let j = 0; j < g.length; j++) res[i + j] ^= qrMul(g[j], coef);
+  }
+  return res.slice(data.length);
+}
+
+function qrMatrix(text) {
+  const bytes = [...new TextEncoder().encode(text)];
+  let ver = 0;
+  for (let v = 1; v <= 5; v++) if (bytes.length + 2 <= QR_SPEC[v][1]) { ver = v; break; }
+  if (!ver) return null;
+  const [size, ndata, nec, ac] = QR_SPEC[ver];
+
+  const bits = [];
+  const push = (val, len) => { for (let i = len - 1; i >= 0; i--) bits.push((val >> i) & 1); };
+  push(4, 4); push(bytes.length, 8);
+  for (const b of bytes) push(b, 8);
+  for (let i = 0; i < 4 && bits.length < ndata * 8; i++) bits.push(0);
+  while (bits.length % 8) bits.push(0);
+  const cw = [];
+  for (let i = 0; i < bits.length; i += 8) { let v = 0; for (let j = 0; j < 8; j++) v = (v << 1) | bits[i + j]; cw.push(v); }
+  let pi = 0; while (cw.length < ndata) cw.push([0xEC, 0x11][pi++ % 2]);
+  const all = cw.concat(qrEcc(cw, nec));
+
+  const m = Array.from({ length: size }, () => new Array(size).fill(0));
+  const fn = Array.from({ length: size }, () => new Array(size).fill(false));
+  const setF = (r, c, v) => { if (r < 0 || c < 0 || r >= size || c >= size) return; m[r][c] = v; fn[r][c] = true; };
+
+  const finder = (r0, c0) => {
+    for (let r = -1; r <= 7; r++) for (let c = -1; c <= 7; c++) {
+      const ring = (r >= 0 && r <= 6 && (c === 0 || c === 6)) || (c >= 0 && c <= 6 && (r === 0 || r === 6));
+      const core = (r >= 2 && r <= 4 && c >= 2 && c <= 4);
+      setF(r0 + r, c0 + c, (ring || core) ? 1 : 0);
+    }
+  };
+  finder(0, 0); finder(0, size - 7); finder(size - 7, 0);
+  for (let i = 8; i < size - 8; i++) { const v = i % 2 === 0 ? 1 : 0; setF(6, i, v); setF(i, 6, v); }
+  if (ac) for (let r = -2; r <= 2; r++) for (let c = -2; c <= 2; c++) setF(ac + r, ac + c, Math.max(Math.abs(r), Math.abs(c)) !== 1 ? 1 : 0);
+  setF(size - 8, 8, 1);
+  for (let i = 0; i <= 8; i++) { if (!fn[8][i]) setF(8, i, 0); if (!fn[i][8]) setF(i, 8, 0); }
+  for (let i = 0; i < 8; i++) { if (!fn[8][size - 1 - i]) setF(8, size - 1 - i, 0); if (!fn[size - 1 - i][8]) setF(size - 1 - i, 8, 0); }
+
+  let idx = 0, up = true;
+  for (let col = size - 1; col > 0; col -= 2) {
+    if (col === 6) col = 5;
+    for (let i = 0; i < size; i++) {
+      const row = up ? size - 1 - i : i;
+      for (let k = 0; k < 2; k++) {
+        const c = col - k;
+        if (fn[row][c]) continue;
+        let dark = 0;
+        if (idx < all.length * 8) { dark = (all[idx >> 3] >> (7 - (idx & 7))) & 1; idx++; }
+        m[row][c] = dark;
+      }
+    }
+    up = !up;
+  }
+
+  const fmtBits = (mask) => {
+    const d = (1 << 3) | mask;
+    let rem = d;
+    for (let i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >> 9) * 0x537);
+    return ((d << 10) | rem) ^ 0x5412;
+  };
+  const applyFormat = (mm, mask) => {
+    const b = fmtBits(mask), g = i => (b >> i) & 1;
+    for (let i = 0; i <= 5; i++) mm[i][8] = g(i);
+    mm[7][8] = g(6); mm[8][8] = g(7); mm[8][7] = g(8);
+    for (let i = 9; i < 15; i++) mm[8][14 - i] = g(i);
+    for (let i = 0; i < 8; i++) mm[8][size - 1 - i] = g(i);
+    for (let i = 8; i < 15; i++) mm[size - 15 + i][8] = g(i);
+    mm[size - 8][8] = 1;
+  };
+  const penalty = (mm) => {
+    let p = 0;
+    const line = arr => {
+      let run = 1, s = 0;
+      for (let i = 1; i < arr.length; i++) { if (arr[i] === arr[i - 1]) run++; else { if (run >= 5) s += 3 + (run - 5); run = 1; } }
+      if (run >= 5) s += 3 + (run - 5);
+      return s;
+    };
+    const pat = [1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0], rpat = pat.slice().reverse();
+    const has = (arr, i, p2) => p2.every((v, j) => arr[i + j] === v);
+    for (let r = 0; r < size; r++) {
+      const row = mm[r], col = mm.map(x => x[r]);
+      p += line(row) + line(col);
+      for (let i = 0; i + 11 <= size; i++) {
+        if (has(row, i, pat) || has(row, i, rpat)) p += 40;
+        if (has(col, i, pat) || has(col, i, rpat)) p += 40;
+      }
+    }
+    for (let r = 0; r < size - 1; r++) for (let c = 0; c < size - 1; c++) {
+      const v = mm[r][c];
+      if (v === mm[r][c + 1] && v === mm[r + 1][c] && v === mm[r + 1][c + 1]) p += 3;
+    }
+    let dark = 0;
+    for (let r = 0; r < size; r++) for (let c = 0; c < size; c++) dark += mm[r][c];
+    p += Math.floor(Math.abs(dark * 100 / (size * size) - 50) / 5) * 10;
+    return p;
+  };
+
+  let best = null, bestP = Infinity;
+  for (let mask = 0; mask < 8; mask++) {
+    const mm = m.map(r => r.slice());
+    for (let r = 0; r < size; r++) for (let c = 0; c < size; c++) if (!fn[r][c] && QR_MASKS[mask](r, c)) mm[r][c] ^= 1;
+    applyFormat(mm, mask);
+    const p = penalty(mm);
+    if (p < bestP) { bestP = p; best = mm; }
+  }
+  return { size, matrix: best };
+}
+
+function qrSvg(text, px) {
+  const q = qrMatrix(text);
+  if (!q) return '<div style="padding:16px;color:#0f172a;font:14px sans-serif">Usa la URL de abajo</div>';
+  const quiet = 4, dim = q.size + quiet * 2;
+  let rects = "";
+  for (let r = 0; r < q.size; r++) {
+    let c = 0;
+    while (c < q.size) {
+      if (q.matrix[r][c]) {
+        let len = 1;
+        while (c + len < q.size && q.matrix[r][c + len]) len++;
+        rects += `<rect x="${c + quiet}" y="${r + quiet}" width="${len}" height="1"/>`;
+        c += len;
+      } else c++;
+    }
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${dim} ${dim}" width="${px}" height="${px}" shape-rendering="crispEdges" style="display:block"><rect width="${dim}" height="${dim}" fill="#ffffff"/><g fill="#000000">${rects}</g></svg>`;
+}
+
+/* ==================================================================
+   6) UTILIDADES
 ================================================================== */
 function cleanRoom(value) {
   const r = String(value || "demo").toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 24);
@@ -239,44 +394,43 @@ function dataUrlToBytes(dataUrl) {
 }
 
 /* ==================================================================
-   6) LAS PAGINAS
+   7) PAGINAS
 ================================================================== */
-function shell(title, body, room, mode, extraHead = "") {
+function shell(title, body, room, mode) {
   return `<!doctype html>
 <html lang="es">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 <title>${title}</title>
-${extraHead}
 <style>
   :root { color-scheme: dark; --bg:#0f172a; --border:#334155; --text:#e2e8f0; --muted:#94a3b8; --accent:#7dd3fc; --accent2:#38bdf8; }
   * { box-sizing: border-box; }
   body { margin:0; font-family: Inter, system-ui, -apple-system, sans-serif; background: radial-gradient(circle at top, #1e293b 0%, var(--bg) 45%); color: var(--text); }
-  main { max-width: 1160px; margin: 0 auto; padding: 22px 18px 48px; }
-  h1 { margin:0 0 8px; font-size: clamp(1.7rem, 4vw, 3rem); letter-spacing:-0.03em; }
-  .kicker { margin:0 0 10px; text-transform:uppercase; letter-spacing:.14em; color:var(--accent); font-size:.74rem; font-weight:700; }
+  main { max-width: 1160px; margin: 0 auto; padding: 18px 18px 40px; }
+  h1 { margin:0 0 6px; font-size: clamp(1.6rem, 3.4vw, 2.6rem); letter-spacing:-0.03em; }
+  .kicker { margin:0 0 8px; text-transform:uppercase; letter-spacing:.14em; color:var(--accent); font-size:.72rem; font-weight:700; }
   .muted { color: var(--muted); }
   .card { border:1px solid var(--border); border-radius:18px; background: rgba(15,23,42,.78); padding:18px; }
   .row { display:grid; grid-template-columns: 320px 1fr; gap:18px; align-items:start; }
-  .board-wrap { background:#fff; border-radius:16px; overflow:hidden; border:1px solid var(--border); }
+  .board-wrap { background:#fff; border-radius:16px; overflow:hidden; border:1px solid var(--border); max-width: min(58vh, 620px); }
   canvas#board { display:block; width:100%; aspect-ratio:1/1; touch-action:none; cursor:crosshair; }
   .button { display:inline-flex; align-items:center; justify-content:center; gap:8px; padding:13px 18px; border:0; border-radius:12px; font-weight:700; font-size:1rem; cursor:pointer; background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#082f49; }
   .button.ghost { background:#0b1220; color:var(--text); border:1px solid var(--border); }
   .button:disabled { opacity:.6; cursor:wait; }
-  .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:14px; }
-  .verdict { margin-top:14px; padding:16px; border-radius:14px; border:1px solid var(--border); background:#0b1220; min-height:58px; font-size:1.2rem; line-height:1.5; }
-  .swatches { display:flex; gap:12px; flex-wrap:wrap; margin-top:14px; }
+  .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:12px; }
+  .verdict { margin-top:12px; padding:14px 16px; border-radius:14px; border:1px solid var(--border); background:#0b1220; min-height:54px; font-size:1.15rem; line-height:1.5; }
+  .swatches { display:flex; gap:12px; flex-wrap:wrap; margin-top:12px; }
   .sw { width:44px; height:44px; border-radius:50%; border:3px solid #0b1220; cursor:pointer; }
   .sw[aria-pressed="true"] { border-color: var(--accent); transform: scale(1.12); }
-  .qr { background:#fff; padding:14px; border-radius:16px; width:fit-content; }
-  .url { font-family: ui-monospace, monospace; font-size:.85rem; word-break:break-all; color:var(--accent); }
+  .qr { background:#fff; padding:10px; border-radius:16px; width:fit-content; line-height:0; }
+  .url { font-family: ui-monospace, monospace; font-size:.8rem; word-break:break-all; color:var(--accent); }
   .pill { display:inline-flex; padding:7px 12px; border-radius:999px; font-size:.82rem; background:#0b1220; border:1px solid var(--border); color:var(--muted); margin-right:8px; }
   .gallery { display:grid; grid-template-columns: repeat(auto-fill, minmax(190px,1fr)); gap:14px; margin-top:18px; }
   .shot { margin:0; background:#0b1220; border:1px solid var(--border); border-radius:14px; overflow:hidden; }
   .shot img { display:block; width:100%; background:#fff; }
   .shot figcaption { padding:10px 12px; font-size:.85rem; color:var(--muted); }
-  @media (max-width: 880px) { .row { grid-template-columns: 1fr; } main { padding:14px 12px 28px; } }
+  @media (max-width: 880px) { .row { grid-template-columns: 1fr; } main { padding:14px 12px 28px; } .board-wrap { max-width:100%; } }
 </style>
 </head>
 <body>
@@ -286,24 +440,24 @@ ${mode === "none" ? "" : `<script>${clientScript(room, mode)}</script>`}
 </html>`;
 }
 
-function pageStage(room) {
+function pageStage(room, phoneUrl) {
   return shell(
     "Draw Jam - dibujo colaborativo con IA",
     `<p class="kicker">Demo en directo - Workers + Durable Objects + Workers AI + R2</p>
      <h1>Draw Jam</h1>
      <p class="muted">Escanea el QR con tu movil y dibuja con el dedo. Todo lo que dibujeis aparece aqui al instante. Despues, un modelo open source de IA intenta adivinar que es.</p>
 
-     <div class="row" style="margin-top:18px;">
+     <div class="row" style="margin-top:16px;">
        <section class="card">
          <h2 style="margin:0 0 12px; font-size:1.05rem;">1 &middot; Escanea para dibujar</h2>
-         <div class="qr"><canvas id="qr"></canvas></div>
-         <p class="url" id="phone-url" style="margin-top:12px;"></p>
-         <p style="margin-top:12px;">
+         <div class="qr">${qrSvg(phoneUrl, 260)}</div>
+         <p class="url" style="margin-top:10px;">${escapeHtml(phoneUrl)}</p>
+         <p style="margin-top:10px;">
            <span class="pill" id="presence">0 conectados</span>
            <span class="pill" id="total">0 analizados</span>
          </p>
          <p class="muted" style="font-size:.85rem;">Sala: <strong>${room}</strong></p>
-         <p style="margin-top:8px;"><a href="/galeria?room=${room}" style="color:var(--accent); font-size:.9rem;">Ver galeria &rarr;</a></p>
+         <p style="margin-top:6px;"><a href="/galeria?room=${room}" style="color:var(--accent); font-size:.9rem;">Ver galeria &rarr;</a></p>
        </section>
 
        <section class="card">
@@ -316,14 +470,13 @@ function pageStage(room) {
            <span class="muted" id="status">Conectando...</span>
          </div>
          <div class="verdict" id="verdict">La IA esta esperando vuestro dibujo...</div>
-         <p class="muted" style="font-size:.8rem; margin-top:10px;">
-           Vision: <strong>LLaVA 1.5 7B</strong> &middot; Texto: <strong>Llama 3.1 8B</strong> &mdash; modelos open source en GPUs de Cloudflare.
+         <p class="muted" style="font-size:.8rem; margin-top:8px;">
+           Vision: <strong>LLaVA 1.5 7B</strong> &middot; Texto: <strong>Llama 3.1 8B</strong> &mdash; modelos open source en GPUs de Cloudflare. QR generado en el Worker.
          </p>
        </section>
      </div>`,
     room,
-    "stage",
-    `<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>`
+    "stage"
   );
 }
 
@@ -331,7 +484,7 @@ function pagePhone(room) {
   return shell(
     "Draw Jam - dibuja",
     `<p class="kicker">Dibuja con el dedo</p>
-     <h1 style="font-size:1.55rem;">Draw Jam</h1>
+     <h1 style="font-size:1.5rem;">Draw Jam</h1>
      <p class="muted" style="font-size:.95rem;">Lo que dibujes aparece en la pantalla grande y en el movil de los demas, al instante.</p>
      <div class="board-wrap" style="margin-top:12px;"><canvas id="board"></canvas></div>
      <div class="swatches" id="swatches"></div>
@@ -346,7 +499,7 @@ function pagePhone(room) {
 }
 
 /* ==================================================================
-   7) CODIGO QUE CORRE EN EL NAVEGADOR
+   8) CODIGO QUE CORRE EN EL NAVEGADOR
 ================================================================== */
 function clientScript(room, mode) {
   return `
@@ -452,17 +605,13 @@ canvas.addEventListener('pointercancel', endStroke);
 canvas.addEventListener('pointerleave', endStroke);
 
 if (MODE === 'stage') {
-  const phoneUrl = location.origin + '/p?room=' + ROOM;
-  const urlEl = document.getElementById('phone-url');
-  if (urlEl) urlEl.textContent = phoneUrl;
-  if (window.QRCode) {
-    window.QRCode.toCanvas(document.getElementById('qr'), phoneUrl, { width: 260, margin: 1 }, function () {});
+  function refreshTotal() {
+    fetch('/stats?room=' + ROOM).then(function (r) { return r.json(); }).then(function (d) {
+      const t = document.getElementById('total');
+      if (t) t.textContent = (d.total || 0) + ' analizados';
+    }).catch(function () {});
   }
-
-  fetch('/stats?room=' + ROOM).then(function (r) { return r.json(); }).then(function (d) {
-    const t = document.getElementById('total');
-    if (t) t.textContent = (d.total || 0) + ' analizados';
-  }).catch(function () {});
+  refreshTotal();
 
   const guessBtn = document.getElementById('guess');
   guessBtn.addEventListener('click', async function () {
@@ -477,10 +626,7 @@ if (MODE === 'stage') {
       });
       const data = await res.json();
       verdictEl.textContent = data.guess || 'Sin respuesta.';
-      fetch('/stats?room=' + ROOM).then(function (r) { return r.json(); }).then(function (d) {
-        const t = document.getElementById('total');
-        if (t) t.textContent = (d.total || 0) + ' analizados';
-      }).catch(function () {});
+      setTimeout(refreshTotal, 1200);
     } catch (err) {
       verdictEl.textContent = 'Error: ' + err.message;
     } finally {
