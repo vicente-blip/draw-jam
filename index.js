@@ -100,43 +100,81 @@ export class DrawRoom extends DurableObject {
 
 /* ==================================================================
    3) LA IA (Workers AI) - modelos open source de Cloudflare
+      Vision: Moondream 3, con Llama 4 Scout como red de seguridad
 ================================================================== */
 async function guessDrawing(request, env, ctx, room) {
+  let debug = [];
   try {
     const body = await request.json();
-    const bytes = dataUrlToBytes(body.image || "");
+    const dataUrl = String(body.image || "");
+    const bytes = dataUrlToBytes(dataUrl);
     if (!bytes || bytes.length < 200) {
       return Response.json({ guess: "Todavia no veo nada dibujado." });
     }
 
-    const vision = await env.AI.run("@cf/llava-hf/llava-1.5-7b-hf", {
-      image: [...bytes],
-      prompt:
-        "This image is a simple hand-drawn doodle on a white background. " +
-        "In one short sentence, say what object or scene it represents " +
-        "(for example: a house, a person, a car, a cat, a tree, the sun).",
-      max_tokens: 60
-    });
+    const question =
+      "This is a simple doodle drawn by hand with a finger: black lines on a white background. " +
+      "What single object or scene does it represent? Answer with two or three words only, " +
+      "for example: a house, a person, a cat, a dog, a car, a tree, the sun, a flower, " +
+      "a boat, a star, a fish, a bicycle, a heart, a cloud.";
 
-    const description = String(vision?.description || vision?.response || "").trim();
-    let verdict = description || "No lo tengo claro, dibujad un poco mas!";
+    let description = "";
 
+    // 1) Moondream 3 - modelo de vision moderno (acepta la imagen como data URI)
     try {
-      const es = await env.AI.run("@cf/meta/llama-3.1-8b-instruct-fp8", {
-        messages: [
-          {
-            role: "system",
-            content:
-              "Eres el presentador de una demo en directo. Recibes en ingles la descripcion " +
-              "de un dibujo hecho a mano y respondes SOLO en espanol, con una frase corta y " +
-              "simpatica que empiece por 'Creo que es'. Maximo 15 palabras."
-          },
-          { role: "user", content: description || "an unclear scribble" }
-        ],
-        max_tokens: 60
+      const r = await env.AI.run("@cf/moondream/moondream3.1-9B-A2B", {
+        task: "query",
+        image: dataUrl,
+        question: question,
+        reasoning: false,
+        max_tokens: 100
       });
-      if (es?.response) verdict = es.response.trim();
-    } catch {}
+      description = String(r?.answer || r?.caption || "").trim();
+      if (description) debug.push("moondream ok");
+    } catch (e) { debug.push("moondream: " + e.message); }
+
+    // 2) Red de seguridad: Llama 4 Scout (multimodal)
+    if (!description) {
+      try {
+        const r = await env.AI.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
+          messages: [{
+            role: "user",
+            content: [
+              { type: "text", text: question },
+              { type: "image_url", image_url: { url: dataUrl } }
+            ]
+          }],
+          max_tokens: 80
+        });
+        description = String(r?.response || "").trim();
+        if (description) debug.push("scout ok");
+      } catch (e) { debug.push("scout: " + e.message); }
+    }
+
+    let verdict = description
+      ? description
+      : "La IA no ha podido analizar el dibujo (" + debug.join(" / ") + ")";
+
+    // 3) Lo convertimos en una frase corta en espanol
+    if (description) {
+      try {
+        const es = await env.AI.run("@cf/meta/llama-3.1-8b-instruct-fp8", {
+          messages: [
+            {
+              role: "system",
+              content:
+                "Eres el presentador de una demo en directo. Recibes en ingles lo que un modelo " +
+                "de vision ha visto en un dibujo hecho a mano, y respondes SOLO en espanol con " +
+                "una frase corta y simpatica que empiece por 'Creo que es'. Maximo 12 palabras. " +
+                "No inventes detalles que no esten en la descripcion."
+            },
+            { role: "user", content: description }
+          ],
+          max_tokens: 60
+        });
+        if (es?.response) verdict = es.response.trim();
+      } catch (e) { debug.push("texto: " + e.message); }
+    }
 
     try {
       const stub = env.DRAW_ROOM.get(env.DRAW_ROOM.idFromName(room));
@@ -145,9 +183,9 @@ async function guessDrawing(request, env, ctx, room) {
 
     ctx.waitUntil(saveSnapshot(env, room, bytes, verdict));
 
-    return Response.json({ guess: verdict, raw: description });
+    return Response.json({ guess: verdict, raw: description, debug: debug.join(" / ") });
   } catch (err) {
-    return Response.json({ guess: "La IA no ha podido mirar el dibujo: " + err.message });
+    return Response.json({ guess: "Fallo al analizar: " + err.message + " [" + debug.join(" / ") + "]" });
   }
 }
 
@@ -204,7 +242,6 @@ async function galleryPage(env, room) {
 
 /* ==================================================================
    5) GENERADOR DE QR PROPIO (sin librerias externas)
-   Codigo QR byte-mode, nivel de correccion L, versiones 1 a 5.
 ================================================================== */
 const QR_EXP = new Uint8Array(512), QR_LOG = new Uint8Array(256);
 (function () {
@@ -471,7 +508,7 @@ function pageStage(room, phoneUrl) {
          </div>
          <div class="verdict" id="verdict">La IA esta esperando vuestro dibujo...</div>
          <p class="muted" style="font-size:.8rem; margin-top:8px;">
-           Vision: <strong>LLaVA 1.5 7B</strong> &middot; Texto: <strong>Llama 3.1 8B</strong> &mdash; modelos open source en GPUs de Cloudflare. QR generado en el Worker.
+           Vision: <strong>Moondream 3</strong> &middot; Texto: <strong>Llama 3.1 8B</strong> &mdash; modelos open source en GPUs de Cloudflare. QR generado en el Worker.
          </p>
        </section>
      </div>`,
@@ -618,7 +655,13 @@ if (MODE === 'stage') {
     guessBtn.disabled = true;
     verdictEl.textContent = 'La IA esta mirando el dibujo...';
     try {
-      const image = canvas.toDataURL('image/jpeg', 0.85);
+      const small = document.createElement('canvas');
+      small.width = 512; small.height = 512;
+      const sctx = small.getContext('2d');
+      sctx.fillStyle = '#ffffff'; sctx.fillRect(0, 0, 512, 512);
+      sctx.drawImage(canvas, 0, 0, 512, 512);
+      const image = small.toDataURL('image/jpeg', 0.8);
+
       const res = await fetch('/guess?room=' + ROOM, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
