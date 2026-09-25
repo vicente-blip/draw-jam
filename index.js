@@ -1,7 +1,18 @@
 import { DurableObject } from "cloudflare:workers";
 
-const BOARD = 900;        // pizarra cuadrada 900x900
-const MAX_STROKES = 2500; // trazos que recordamos por sala
+const BOARD = 900;                // pizarra cuadrada 900x900
+const MAX_STROKES = 2500;         // trazos que recordamos por sala
+const CHECK_SECONDS = 15;         // cada cuanto se revisa la pizarra
+const AI_GATEWAY_ID = "draw-jam"; // tu AI Gateway ("" para desactivarlo)
+
+/* ==================================================================
+   0) TODAS LAS LLAMADAS DE IA PASAN POR AI GATEWAY
+   No hace falta token: el binding AI del Worker ya esta autenticado.
+================================================================== */
+async function aiRun(env, model, inputs) {
+  const opts = AI_GATEWAY_ID ? { gateway: { id: AI_GATEWAY_ID } } : undefined;
+  return env.AI.run(model, inputs, opts);
+}
 
 /* ==================================================================
    1) ROUTER
@@ -23,6 +34,10 @@ export default {
       return guessDrawing(request, env, ctx, room);
     }
 
+    if (url.pathname === "/moderate" && request.method === "POST") {
+      return moderateBoard(request, env, room);
+    }
+
     if (url.pathname === "/stats") {
       return Response.json({ total: await countSaved(env, room) });
     }
@@ -30,7 +45,7 @@ export default {
     if (url.pathname === "/p") return htmlResponse(pagePhone(room));
     if (url.pathname === "/galeria") return galleryPage(env, room);
     if (url.pathname.startsWith("/img/")) return serveImage(env, decodeURIComponent(url.pathname.slice(5)));
-    if (url.pathname === "/health") return Response.json({ ok: true, room });
+    if (url.pathname === "/health") return Response.json({ ok: true, room, gateway: AI_GATEWAY_ID });
     if (url.pathname === "/") return htmlResponse(pageStage(room, url.origin + "/p?room=" + room));
 
     return new Response("No encontrado", { status: 404 });
@@ -84,6 +99,12 @@ export class DrawRoom extends DurableObject {
     return true;
   }
 
+  async wipe(text) {
+    await this.ctx.storage.deleteAll();
+    this.broadcast({ type: "blocked", text: String(text || "Pizarra borrada.") });
+    return true;
+  }
+
   broadcast(obj, except) {
     const data = JSON.stringify(obj);
     for (const ws of this.ctx.getWebSockets()) {
@@ -99,8 +120,81 @@ export class DrawRoom extends DurableObject {
 }
 
 /* ==================================================================
-   3) LA IA (Workers AI) - modelos open source de Cloudflare
-      Vision: Moondream 3, con Llama 4 Scout como red de seguridad
+   3) MODERACION
+   El modelo de vision DESCRIBE el dibujo con una pregunta neutra.
+   Ese texto pasa por AI Gateway -> Guardrails lo bloquea si procede.
+   Llama Guard 3 actua de segunda opinion. Si algo falla, se deja pasar.
+================================================================== */
+const DESCRIBE_QUESTION =
+  "Describe in one short sentence what this hand-drawn doodle shows.";
+
+function isGuardrailError(m) {
+  return /guardrail|blocked|unsafe|violat|content policy/i.test(String(m || ""));
+}
+
+async function checkTextSafety(env, text) {
+  try {
+    const r = await aiRun(env, "@cf/meta/llama-guard-3-8b", {
+      messages: [{ role: "user", content: String(text) }]
+    });
+    const out = String(r?.response || "").toLowerCase();
+    return { flagged: out.includes("unsafe"), by: "llama-guard" };
+  } catch (e) {
+    if (isGuardrailError(e.message)) return { flagged: true, by: "ai-gateway-guardrails" };
+    return { flagged: false, error: e.message };
+  }
+}
+
+async function checkImageSafety(env, dataUrl) {
+  let description = "";
+  try {
+    const r = await aiRun(env, "@cf/moondream/moondream3.1-9B-A2B", {
+      task: "query",
+      image: dataUrl,
+      question: DESCRIBE_QUESTION,
+      reasoning: false,
+      max_tokens: 60
+    });
+    description = String(r?.answer || r?.caption || "").trim();
+  } catch (e) {
+    if (isGuardrailError(e.message)) {
+      return { flagged: true, by: "ai-gateway-guardrails", description: "" };
+    }
+    return { flagged: false, error: e.message };
+  }
+
+  if (!description) return { flagged: false };
+
+  const t = await checkTextSafety(env, description);
+  return { flagged: t.flagged, by: t.by, description };
+}
+
+const BLOCKED_MSG = "Contenido no apropiado detectado. La pizarra se ha borrado automaticamente.";
+
+async function wipeRoom(env, room, text) {
+  try {
+    const stub = env.DRAW_ROOM.get(env.DRAW_ROOM.idFromName(room));
+    await stub.wipe(text);
+  } catch {}
+}
+
+async function moderateBoard(request, env, room) {
+  try {
+    const body = await request.json();
+    const dataUrl = String(body.image || "");
+    if (dataUrl.length < 200) return Response.json({ flagged: false });
+
+    const safety = await checkImageSafety(env, dataUrl);
+    if (safety.flagged) await wipeRoom(env, room, BLOCKED_MSG);
+
+    return Response.json({ flagged: safety.flagged, by: safety.by || null });
+  } catch (e) {
+    return Response.json({ flagged: false, error: e.message });
+  }
+}
+
+/* ==================================================================
+   4) LA IA QUE ADIVINA (Workers AI via AI Gateway)
 ================================================================== */
 async function guessDrawing(request, env, ctx, room) {
   let debug = [];
@@ -112,6 +206,13 @@ async function guessDrawing(request, env, ctx, room) {
       return Response.json({ guess: "Todavia no veo nada dibujado." });
     }
 
+    // Moderacion antes de nada
+    const safety = await checkImageSafety(env, dataUrl);
+    if (safety.flagged) {
+      await wipeRoom(env, room, BLOCKED_MSG);
+      return Response.json({ guess: BLOCKED_MSG, blocked: true, by: safety.by });
+    }
+
     const question =
       "This is a simple doodle drawn by hand with a finger: black lines on a white background. " +
       "What single object or scene does it represent? Answer with two or three words only, " +
@@ -119,10 +220,11 @@ async function guessDrawing(request, env, ctx, room) {
       "a boat, a star, a fish, a bicycle, a heart, a cloud.";
 
     let description = "";
+    let guardBlocked = false;
 
-    // 1) Moondream 3 - modelo de vision moderno (acepta la imagen como data URI)
+    // Moondream 3
     try {
-      const r = await env.AI.run("@cf/moondream/moondream3.1-9B-A2B", {
+      const r = await aiRun(env, "@cf/moondream/moondream3.1-9B-A2B", {
         task: "query",
         image: dataUrl,
         question: question,
@@ -131,12 +233,15 @@ async function guessDrawing(request, env, ctx, room) {
       });
       description = String(r?.answer || r?.caption || "").trim();
       if (description) debug.push("moondream ok");
-    } catch (e) { debug.push("moondream: " + e.message); }
+    } catch (e) {
+      debug.push("moondream: " + e.message);
+      if (isGuardrailError(e.message)) guardBlocked = true;
+    }
 
-    // 2) Red de seguridad: Llama 4 Scout (multimodal)
-    if (!description) {
+    // Red de seguridad: Llama 4 Scout
+    if (!description && !guardBlocked) {
       try {
-        const r = await env.AI.run("@cf/meta/llama-4-scout-17b-16e-instruct", {
+        const r = await aiRun(env, "@cf/meta/llama-4-scout-17b-16e-instruct", {
           messages: [{
             role: "user",
             content: [
@@ -148,17 +253,24 @@ async function guessDrawing(request, env, ctx, room) {
         });
         description = String(r?.response || "").trim();
         if (description) debug.push("scout ok");
-      } catch (e) { debug.push("scout: " + e.message); }
+      } catch (e) {
+        debug.push("scout: " + e.message);
+        if (isGuardrailError(e.message)) guardBlocked = true;
+      }
+    }
+
+    if (guardBlocked) {
+      await wipeRoom(env, room, BLOCKED_MSG);
+      return Response.json({ guess: BLOCKED_MSG, blocked: true, by: "ai-gateway-guardrails" });
     }
 
     let verdict = description
       ? description
       : "La IA no ha podido analizar el dibujo (" + debug.join(" / ") + ")";
 
-    // 3) Lo convertimos en una frase corta en espanol
     if (description) {
       try {
-        const es = await env.AI.run("@cf/meta/llama-3.1-8b-instruct-fp8", {
+        const es = await aiRun(env, "@cf/meta/llama-3.1-8b-instruct-fp8", {
           messages: [
             {
               role: "system",
@@ -190,7 +302,7 @@ async function guessDrawing(request, env, ctx, room) {
 }
 
 /* ==================================================================
-   4) GALERIA EN R2
+   5) GALERIA EN R2
 ================================================================== */
 async function saveSnapshot(env, room, bytes, verdict) {
   try {
@@ -241,7 +353,7 @@ async function galleryPage(env, room) {
 }
 
 /* ==================================================================
-   5) GENERADOR DE QR PROPIO (sin librerias externas)
+   6) GENERADOR DE QR PROPIO (sin librerias externas)
 ================================================================== */
 const QR_EXP = new Uint8Array(512), QR_LOG = new Uint8Array(256);
 (function () {
@@ -404,7 +516,7 @@ function qrSvg(text, px) {
 }
 
 /* ==================================================================
-   6) UTILIDADES
+   7) UTILIDADES
 ================================================================== */
 function cleanRoom(value) {
   const r = String(value || "demo").toLowerCase().replace(/[^a-z0-9-]/g, "").slice(0, 24);
@@ -431,7 +543,7 @@ function dataUrlToBytes(dataUrl) {
 }
 
 /* ==================================================================
-   7) PAGINAS
+   8) PAGINAS
 ================================================================== */
 function shell(title, body, room, mode) {
   return `<!doctype html>
@@ -441,7 +553,7 @@ function shell(title, body, room, mode) {
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 <title>${title}</title>
 <style>
-  :root { color-scheme: dark; --bg:#0f172a; --border:#334155; --text:#e2e8f0; --muted:#94a3b8; --accent:#7dd3fc; --accent2:#38bdf8; }
+  :root { color-scheme: dark; --bg:#0f172a; --border:#334155; --text:#e2e8f0; --muted:#94a3b8; --accent:#7dd3fc; --accent2:#38bdf8; --danger:#ef4444; }
   * { box-sizing: border-box; }
   body { margin:0; font-family: Inter, system-ui, -apple-system, sans-serif; background: radial-gradient(circle at top, #1e293b 0%, var(--bg) 45%); color: var(--text); }
   main { max-width: 1160px; margin: 0 auto; padding: 18px 18px 40px; }
@@ -456,7 +568,8 @@ function shell(title, body, room, mode) {
   .button.ghost { background:#0b1220; color:var(--text); border:1px solid var(--border); }
   .button:disabled { opacity:.6; cursor:wait; }
   .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:12px; }
-  .verdict { margin-top:12px; padding:14px 16px; border-radius:14px; border:1px solid var(--border); background:#0b1220; min-height:54px; font-size:1.15rem; line-height:1.5; }
+  .verdict { margin-top:12px; padding:14px 16px; border-radius:14px; border:1px solid var(--border); background:#0b1220; min-height:54px; font-size:1.15rem; line-height:1.5; transition: border-color .2s, color .2s; }
+  .verdict.blocked { border-color: var(--danger); color: #fecaca; }
   .swatches { display:flex; gap:12px; flex-wrap:wrap; margin-top:12px; }
   .sw { width:44px; height:44px; border-radius:50%; border:3px solid #0b1220; cursor:pointer; }
   .sw[aria-pressed="true"] { border-color: var(--accent); transform: scale(1.12); }
@@ -480,7 +593,7 @@ ${mode === "none" ? "" : `<script>${clientScript(room, mode)}</script>`}
 function pageStage(room, phoneUrl) {
   return shell(
     "Draw Jam - dibujo colaborativo con IA",
-    `<p class="kicker">Demo en directo - Workers + Durable Objects + Workers AI + R2</p>
+    `<p class="kicker">Workers + Durable Objects + Workers AI + AI Gateway + R2</p>
      <h1>Draw Jam</h1>
      <p class="muted">Escanea el QR con tu movil y dibuja con el dedo. Todo lo que dibujeis aparece aqui al instante. Despues, un modelo open source de IA intenta adivinar que es.</p>
 
@@ -494,6 +607,7 @@ function pageStage(room, phoneUrl) {
            <span class="pill" id="total">0 analizados</span>
          </p>
          <p class="muted" style="font-size:.85rem;">Sala: <strong>${room}</strong></p>
+         <p class="muted" style="font-size:.8rem;">Moderacion automatica cada ${CHECK_SECONDS}s</p>
          <p style="margin-top:6px;"><a href="/galeria?room=${room}" style="color:var(--accent); font-size:.9rem;">Ver galeria &rarr;</a></p>
        </section>
 
@@ -508,7 +622,7 @@ function pageStage(room, phoneUrl) {
          </div>
          <div class="verdict" id="verdict">La IA esta esperando vuestro dibujo...</div>
          <p class="muted" style="font-size:.8rem; margin-top:8px;">
-           Vision: <strong>Moondream 3</strong> &middot; Texto: <strong>Llama 3.1 8B</strong> &mdash; modelos open source en GPUs de Cloudflare. QR generado en el Worker.
+           Vision: <strong>Moondream 3</strong> &middot; Texto: <strong>Llama 3.1 8B</strong> &middot; Moderacion: <strong>AI Gateway Guardrails + Llama Guard 3</strong> &middot; Todo via <strong>AI Gateway</strong>.
          </p>
        </section>
      </div>`,
@@ -522,7 +636,7 @@ function pagePhone(room) {
     "Draw Jam - dibuja",
     `<p class="kicker">Dibuja con el dedo</p>
      <h1 style="font-size:1.5rem;">Draw Jam</h1>
-     <p class="muted" style="font-size:.95rem;">Lo que dibujes aparece en la pantalla grande y en el movil de los demas, al instante.</p>
+     <p class="muted" style="font-size:.95rem;">Lo que dibujes aparece en la pantalla grande y en el movil de los demas, al instante. Hay moderacion automatica de contenido.</p>
      <div class="board-wrap" style="margin-top:12px;"><canvas id="board"></canvas></div>
      <div class="swatches" id="swatches"></div>
      <div class="bar">
@@ -536,13 +650,14 @@ function pagePhone(room) {
 }
 
 /* ==================================================================
-   8) CODIGO QUE CORRE EN EL NAVEGADOR
+   9) CODIGO QUE CORRE EN EL NAVEGADOR
 ================================================================== */
 function clientScript(room, mode) {
   return `
 const MODE = '${mode}';
 const ROOM = '${room}';
 const SIZE = ${BOARD};
+const CHECK_MS = ${CHECK_SECONDS} * 1000;
 
 const canvas = document.getElementById('board');
 canvas.width = SIZE; canvas.height = SIZE;
@@ -550,8 +665,19 @@ const cx = canvas.getContext('2d');
 const statusEl = document.getElementById('status');
 const verdictEl = document.getElementById('verdict');
 
+let dirty = false;
+
 function background() { cx.fillStyle = '#ffffff'; cx.fillRect(0, 0, SIZE, SIZE); }
 background();
+
+function snapshot(px, quality) {
+  const small = document.createElement('canvas');
+  small.width = px; small.height = px;
+  const sctx = small.getContext('2d');
+  sctx.fillStyle = '#ffffff'; sctx.fillRect(0, 0, px, px);
+  sctx.drawImage(canvas, 0, 0, px, px);
+  return small.toDataURL('image/jpeg', quality);
+}
 
 function paint(s) {
   const pts = s && s.p;
@@ -565,6 +691,13 @@ function paint(s) {
   if (pts.length === 1) cx.lineTo(pts[0][0] * SIZE + 0.1, pts[0][1] * SIZE);
   for (let i = 1; i < pts.length; i++) cx.lineTo(pts[i][0] * SIZE, pts[i][1] * SIZE);
   cx.stroke();
+  dirty = true;
+}
+
+function setVerdict(text, blocked) {
+  verdictEl.textContent = text;
+  if (blocked) verdictEl.classList.add('blocked');
+  else verdictEl.classList.remove('blocked');
 }
 
 let ws = null;
@@ -577,8 +710,9 @@ function connect() {
     let msg; try { msg = JSON.parse(event.data); } catch (e) { return; }
     if (msg.type === 'init') { background(); (msg.strokes || []).forEach(paint); }
     else if (msg.type === 'stroke') paint(msg.stroke);
-    else if (msg.type === 'clear') { background(); verdictEl.textContent = 'Pizarra limpia. A dibujar!'; }
-    else if (msg.type === 'guess') verdictEl.textContent = msg.text;
+    else if (msg.type === 'clear') { background(); dirty = false; setVerdict('Pizarra limpia. A dibujar!', false); }
+    else if (msg.type === 'blocked') { background(); dirty = false; setVerdict(msg.text, true); }
+    else if (msg.type === 'guess') setVerdict(msg.text, false);
     else if (msg.type === 'presence') {
       const p = document.getElementById('presence');
       if (p) p.textContent = msg.count + (msg.count === 1 ? ' conectado' : ' conectados');
@@ -589,7 +723,7 @@ function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj))
 connect();
 
 const clearBtn = document.getElementById('clear');
-if (clearBtn) clearBtn.addEventListener('click', function () { background(); send({ type: 'clear' }); });
+if (clearBtn) clearBtn.addEventListener('click', function () { background(); dirty = false; send({ type: 'clear' }); });
 
 let color = '#0f172a';
 const box = document.getElementById('swatches');
@@ -650,32 +784,33 @@ if (MODE === 'stage') {
   }
   refreshTotal();
 
+  setInterval(function () {
+    if (!dirty || drawing) return;
+    dirty = false;
+    fetch('/moderate?room=' + ROOM, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ image: snapshot(384, 0.7) })
+    }).catch(function () {});
+  }, CHECK_MS);
+
   const guessBtn = document.getElementById('guess');
   guessBtn.addEventListener('click', async function () {
     guessBtn.disabled = true;
-    verdictEl.textContent = 'La IA esta mirando el dibujo...';
+    setVerdict('La IA esta mirando el dibujo...', false);
     try {
-      const small = document.createElement('canvas');
-      small.width = 512; small.height = 512;
-      const sctx = small.getContext('2d');
-      sctx.fillStyle = '#ffffff'; sctx.fillRect(0, 0, 512, 512);
-      sctx.drawImage(canvas, 0, 0, 512, 512);
-      const image = small.toDataURL('image/jpeg', 0.8);
-
       const res = await fetch('/guess?room=' + ROOM, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ image: image })
+        body: JSON.stringify({ image: snapshot(512, 0.8) })
       });
       const data = await res.json();
-      verdictEl.textContent = data.guess || 'Sin respuesta.';
+      setVerdict(data.guess || 'Sin respuesta.', !!data.blocked);
       setTimeout(refreshTotal, 1200);
     } catch (err) {
-      verdictEl.textContent = 'Error: ' + err.message;
+      setVerdict('Error: ' + err.message, false);
     } finally {
       guessBtn.disabled = false;
     }
   });
-}
-`;
 }
