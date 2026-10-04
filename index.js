@@ -649,9 +649,12 @@ function shell(title, body, room, mode) {
   .shot img { display:block; width:100%; background:#fff; }
   .shot figcaption { padding:10px 12px; font-size:.85rem; color:var(--muted); }
   @media (max-width: 880px) { .row { grid-template-columns: 1fr; } main { padding:14px 12px 28px; } .board-wrap { max-width:100%; } }
+
+  :root{color-scheme:light;--bg:#fff;--border:#d9d9df;--text:#1d1d1f;--muted:#62636a;--accent:#e85d04;--accent2:#f6821f;--danger:#b42318} body{background:#fff;color:var(--text)} .cf-header{border-bottom:1px solid var(--border);background:#fff}.cf-nav{max-width:1160px;min-height:70px;margin:auto;padding:0 18px;display:flex;align-items:center;justify-content:space-between}.cf-brand{display:flex;align-items:center;gap:10px;color:var(--text);font-weight:750;text-decoration:none}.cf-brand img{width:112px}.cf-brand span{border-left:1px solid var(--border);padding-left:10px;font-size:.9rem}.cf-back{color:var(--text);font-weight:700;text-decoration:none;font-size:.9rem}.cf-back:hover{color:var(--accent)}main{padding-top:34px}.card{background:#f7f7f8;border-radius:4px}.button{background:#e85d04;color:#fff;border-radius:2px}.button:hover{background:#c94d00}.button.ghost{background:#fff;color:var(--text);border-color:#bdbfc7}.verdict,.pill,.shot{background:#fff}.board-wrap,.qr{border-radius:3px}.kicker{color:#e85d04}@media(max-width:500px){.cf-brand span{display:none}}
 </style>
 </head>
 <body>
+<header class="cf-header"><nav class="cf-nav"><a class="cf-brand" href="https://poc.vpuchades.nl"><img src="https://developers.cloudflare.com/logo.svg" alt="Cloudflare"><span>Draw Jam</span></a><a class="cf-back" href="https://poc.vpuchades.nl">← All demos</a></nav></header>
 <main>${body}</main>
 ${mode === "none" ? "" : `<script>${clientScript(room, mode)}</script>`}
 </body>
